@@ -18,8 +18,8 @@ GROUP_BY_MAP = {
 }
 
 ORGANIZATION_TYPE_MAP = {
-    "non_profit": "Non-Profit",
-    "for_profit": "For-profit",
+    "non_profit": "non_profit",
+    "for_profit": "for_profit",
 }
 
 
@@ -166,17 +166,11 @@ def check_is_contributor_available(cursor):
     return bool(row and row["column_exists"])
 
 
-def build_filters(filters, include_region=True):
-    """
-    Creates a parameterized WHERE clause.
-
-    Region is interpreted as state name or state_id.
-    Organization type uses the API values:
-        non_profit
-        for_profit
-
-    and maps them to values stored in the sample DB.
-    """
+def build_filters(
+    filters,
+    include_region=True,
+    include_time=True,
+):
     conditions = []
     params = []
 
@@ -184,30 +178,30 @@ def build_filters(filters, include_region=True):
         filters.get("time_filter", "ALL")
     ).upper()
 
-    if time_filter == "7D":
-        conditions.append(
-            "o.created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'"
-        )
+    if include_time:
+        if time_filter == "7D":
+            conditions.append(
+                "o.created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'"
+            )
 
-    elif time_filter == "30D":
-        conditions.append(
-            "o.created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'"
-        )
+        elif time_filter == "30D":
+            conditions.append(
+                "o.created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'"
+            )
 
-    elif time_filter == "1Y":
-        conditions.append(
-            "o.created_at >= CURRENT_TIMESTAMP - INTERVAL '1 year'"
-        )
+        elif time_filter == "1Y":
+            conditions.append(
+                "o.created_at >= CURRENT_TIMESTAMP - INTERVAL '1 year'"
+            )
 
-    elif time_filter == "CUSTOM":
-        conditions.append("o.created_at >= %s")
-        params.append(filters["start_date"])
+        elif time_filter == "CUSTOM":
+            conditions.append("o.created_at >= %s")
+            params.append(filters["start_date"])
 
-        # Include the entire end date.
-        conditions.append(
-            "o.created_at < (%s::date + INTERVAL '1 day')"
-        )
-        params.append(filters["end_date"])
+            conditions.append(
+                "o.created_at < (%s::date + INTERVAL '1 day')"
+            )
+            params.append(filters["end_date"])
 
     region = filters.get("region", "ALL")
 
@@ -232,7 +226,7 @@ def build_filters(filters, include_region=True):
         db_value = ORGANIZATION_TYPE_MAP[organization_type]
 
         conditions.append(
-            "LOWER(o.org_type) = LOWER(%s)"
+            "LOWER(REPLACE(o.org_type::text, '-', '_')) = %s"
         )
         params.append(db_value)
 
@@ -273,7 +267,7 @@ def fetch_summary(cursor, filters, contributor_available):
 
         FROM {SCHEMA_NAME}.organizations o
 
-        LEFT JOIN {SCHEMA_NAME}.state s
+        LEFT JOIN {SCHEMA_NAME}.states s
             ON o.state_id = s.state_id
 
         {where_clause};
@@ -301,62 +295,240 @@ def fetch_summary(cursor, filters, contributor_available):
 
 
 def fetch_growth_trend(cursor, filters):
-    where_clause, params = build_filters(filters)
-
     group_by = str(
         filters.get("group_by", "daily")
     ).lower()
 
     interval = GROUP_BY_MAP[group_by]
 
-    query = f"""
-        WITH period_counts AS (
-            SELECT
-                DATE_TRUNC(
-                    '{interval}',
-                    o.created_at
-                ) AS period,
+    time_filter = str(
+        filters.get("time_filter", "ALL")
+    ).upper()
 
-                COUNT(*) AS organizations_added,
-
-                COUNT(*) FILTER (
-                    WHERE o.is_collaborator = TRUE
-                ) AS collaborators_added
-
-            FROM {SCHEMA_NAME}.organizations o
-
-            LEFT JOIN {SCHEMA_NAME}.state s
-                ON o.state_id = s.state_id
-
-            {where_clause}
-
-            GROUP BY 1
+    # ALL does not require a pre-range baseline.
+    if time_filter == "ALL":
+        where_clause, params = build_filters(
+            filters
         )
 
-        SELECT
-            period,
+        query = f"""
+            WITH period_counts AS (
+                SELECT
+                    DATE_TRUNC(
+                        '{interval}',
+                        o.created_at
+                    ) AS period,
 
-            SUM(organizations_added)
-                OVER (
-                    ORDER BY period
-                    ROWS BETWEEN UNBOUNDED PRECEDING
-                    AND CURRENT ROW
-                ) AS total_organizations,
+                    COUNT(*) AS organizations_added,
 
-            SUM(collaborators_added)
-                OVER (
-                    ORDER BY period
-                    ROWS BETWEEN UNBOUNDED PRECEDING
-                    AND CURRENT ROW
-                ) AS total_collaborators
+                    COUNT(*) FILTER (
+                        WHERE o.is_collaborator IS TRUE
+                    ) AS collaborators_added
 
-        FROM period_counts
+                FROM {SCHEMA_NAME}.organizations o
 
-        ORDER BY period;
-    """
+                LEFT JOIN {SCHEMA_NAME}.states s
+                    ON o.state_id = s.state_id
 
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
+                {where_clause}
+
+                GROUP BY 1
+            )
+
+            SELECT
+                period,
+
+                SUM(organizations_added)
+                    OVER (
+                        ORDER BY period
+                        ROWS BETWEEN UNBOUNDED PRECEDING
+                        AND CURRENT ROW
+                    ) AS total_organizations,
+
+                SUM(collaborators_added)
+                    OVER (
+                        ORDER BY period
+                        ROWS BETWEEN UNBOUNDED PRECEDING
+                        AND CURRENT ROW
+                    ) AS total_collaborators
+
+            FROM period_counts
+
+            ORDER BY period;
+        """
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+    else:
+        # Apply region / organization type to both the baseline
+        # and selected period, but do not apply the date filter yet.
+        non_date_where, non_date_params = build_filters(
+            filters,
+            include_time=False,
+        )
+
+        if time_filter == "7D":
+            start_expression = (
+                "CURRENT_TIMESTAMP - INTERVAL '7 days'"
+            )
+            period_date_condition = (
+                "o.created_at >= "
+                "CURRENT_TIMESTAMP - INTERVAL '7 days'"
+            )
+
+            baseline_params = list(
+                non_date_params
+            )
+            period_params = list(
+                non_date_params
+            )
+
+        elif time_filter == "30D":
+            start_expression = (
+                "CURRENT_TIMESTAMP - INTERVAL '30 days'"
+            )
+            period_date_condition = (
+                "o.created_at >= "
+                "CURRENT_TIMESTAMP - INTERVAL '30 days'"
+            )
+
+            baseline_params = list(
+                non_date_params
+            )
+            period_params = list(
+                non_date_params
+            )
+
+        elif time_filter == "1Y":
+            start_expression = (
+                "CURRENT_TIMESTAMP - INTERVAL '1 year'"
+            )
+            period_date_condition = (
+                "o.created_at >= "
+                "CURRENT_TIMESTAMP - INTERVAL '1 year'"
+            )
+
+            baseline_params = list(
+                non_date_params
+            )
+            period_params = list(
+                non_date_params
+            )
+
+        else:  # CUSTOM
+            start_expression = "%s::timestamp"
+
+            period_date_condition = (
+                "o.created_at >= %s "
+                "AND o.created_at < "
+                "(%s::date + INTERVAL '1 day')"
+            )
+
+            baseline_params = (
+                list(non_date_params)
+                + [filters["start_date"]]
+            )
+
+            period_params = (
+                list(non_date_params)
+                + [
+                    filters["start_date"],
+                    filters["end_date"],
+                ]
+            )
+
+        baseline_where = (
+            f"{non_date_where} AND "
+            f"o.created_at < {start_expression}"
+            if non_date_where
+            else
+            f"WHERE o.created_at < {start_expression}"
+        )
+
+        period_where = (
+            f"{non_date_where} AND "
+            f"{period_date_condition}"
+            if non_date_where
+            else
+            f"WHERE {period_date_condition}"
+        )
+
+        query = f"""
+            WITH baseline AS (
+                SELECT
+                    COUNT(*) AS organizations_before,
+
+                    COUNT(*) FILTER (
+                        WHERE o.is_collaborator IS TRUE
+                    ) AS collaborators_before
+
+                FROM {SCHEMA_NAME}.organizations o
+
+                LEFT JOIN {SCHEMA_NAME}.states s
+                    ON o.state_id = s.state_id
+
+                {baseline_where}
+            ),
+
+            period_counts AS (
+                SELECT
+                    DATE_TRUNC(
+                        '{interval}',
+                        o.created_at
+                    ) AS period,
+
+                    COUNT(*) AS organizations_added,
+
+                    COUNT(*) FILTER (
+                        WHERE o.is_collaborator IS TRUE
+                    ) AS collaborators_added
+
+                FROM {SCHEMA_NAME}.organizations o
+
+                LEFT JOIN {SCHEMA_NAME}.states s
+                    ON o.state_id = s.state_id
+
+                {period_where}
+
+                GROUP BY 1
+            )
+
+            SELECT
+                pc.period,
+
+                b.organizations_before
+                +
+                SUM(pc.organizations_added)
+                    OVER (
+                        ORDER BY pc.period
+                        ROWS BETWEEN UNBOUNDED PRECEDING
+                        AND CURRENT ROW
+                    ) AS total_organizations,
+
+                b.collaborators_before
+                +
+                SUM(pc.collaborators_added)
+                    OVER (
+                        ORDER BY pc.period
+                        ROWS BETWEEN UNBOUNDED PRECEDING
+                        AND CURRENT ROW
+                    ) AS total_collaborators
+
+            FROM period_counts pc
+
+            CROSS JOIN baseline b
+
+            ORDER BY pc.period;
+        """
+
+        params = (
+            baseline_params
+            + period_params
+        )
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
 
     return [
         {
@@ -371,48 +543,47 @@ def fetch_growth_trend(cursor, filters):
         for row in rows
     ]
 
-
 def fetch_organizations_by_location(cursor, filters):
     where_clause, params = build_filters(filters)
 
-    query = f"""
-        WITH location_counts AS (
+    state_query = f"""
+        WITH state_counts AS (
             SELECT
                 o.state_id,
                 s.state_name,
-                o.city_name,
                 COUNT(*) AS organization_count
 
             FROM {SCHEMA_NAME}.organizations o
 
-            LEFT JOIN {SCHEMA_NAME}.state s
+            LEFT JOIN {SCHEMA_NAME}.states s
                 ON o.state_id = s.state_id
 
             {where_clause}
 
             GROUP BY
                 o.state_id,
-                s.state_name,
-                o.city_name
+                s.state_name
         ),
 
         total AS (
             SELECT
-                SUM(organization_count) AS total_count
-            FROM location_counts
+                COALESCE(
+                    SUM(organization_count),
+                    0
+                ) AS total_count
+            FROM state_counts
         )
 
         SELECT
-            lc.state_id,
-            lc.state_name,
-            lc.city_name,
-            lc.organization_count,
+            sc.state_id,
+            sc.state_name,
+            sc.organization_count,
 
             CASE
                 WHEN t.total_count > 0
                 THEN ROUND(
                     (
-                        lc.organization_count::numeric
+                        sc.organization_count::numeric
                         / t.total_count
                     ) * 100,
                     2
@@ -420,34 +591,108 @@ def fetch_organizations_by_location(cursor, filters):
                 ELSE 0
             END AS percentage
 
-        FROM location_counts lc
+        FROM state_counts sc
 
         CROSS JOIN total t
 
         ORDER BY
-            lc.organization_count DESC,
-            lc.state_name,
-            lc.city_name;
+            sc.organization_count DESC,
+            sc.state_name;
     """
 
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
+    cursor.execute(state_query, params)
+    state_rows = cursor.fetchall()
 
-    return [
-        {
-            "state_id": row["state_id"],
-            "state_name": row["state_name"],
-            "city_name": row["city_name"],
-            "organization_count": int(
-                row["organization_count"] or 0
-            ),
-            "percentage": float(
-                row["percentage"] or 0
-            ),
-        }
-        for row in rows
-    ]
+    city_query = f"""
+        WITH city_counts AS (
+            SELECT
+                o.city_name,
+                o.state_id,
+                s.state_name,
+                COUNT(*) AS organization_count
 
+            FROM {SCHEMA_NAME}.organizations o
+
+            LEFT JOIN {SCHEMA_NAME}.states s
+                ON o.state_id = s.state_id
+
+            {where_clause}
+
+            GROUP BY
+                o.city_name,
+                o.state_id,
+                s.state_name
+        ),
+
+        total AS (
+            SELECT
+                COALESCE(
+                    SUM(organization_count),
+                    0
+                ) AS total_count
+            FROM city_counts
+        )
+
+        SELECT
+            cc.city_name,
+            cc.state_id,
+            cc.state_name,
+            cc.organization_count,
+
+            CASE
+                WHEN t.total_count > 0
+                THEN ROUND(
+                    (
+                        cc.organization_count::numeric
+                        / t.total_count
+                    ) * 100,
+                    2
+                )
+                ELSE 0
+            END AS percentage
+
+        FROM city_counts cc
+
+        CROSS JOIN total t
+
+        ORDER BY
+            cc.organization_count DESC,
+            cc.city_name;
+    """
+
+    cursor.execute(city_query, params)
+    city_rows = cursor.fetchall()
+
+    return {
+        "by_state": [
+            {
+                "state_id": row["state_id"],
+                "state_name": row["state_name"],
+                "organization_count": int(
+                    row["organization_count"] or 0
+                ),
+                "percentage": float(
+                    row["percentage"] or 0
+                ),
+            }
+            for row in state_rows
+        ],
+
+        "by_city": [
+            {
+                "city_name": row["city_name"],
+                "state_id": row["state_id"],
+                "state_name": row["state_name"],
+                "organization_count": int(
+                    row["organization_count"] or 0
+                ),
+                "percentage": float(
+                    row["percentage"] or 0
+                ),
+            }
+            for row in city_rows
+        ],
+    }
 
 def fetch_organizations_by_size(cursor, filters):
     where_clause, params = build_filters(filters)
@@ -459,7 +704,7 @@ def fetch_organizations_by_size(cursor, filters):
 
         FROM {SCHEMA_NAME}.organizations o
 
-        LEFT JOIN {SCHEMA_NAME}.state s
+        LEFT JOIN {SCHEMA_NAME}.states s
             ON o.state_id = s.state_id
 
         {where_clause}
@@ -490,30 +735,111 @@ def fetch_collaborator_vs_contributor(
 ):
     where_clause, params = build_filters(filters)
 
-    contributor_expression = (
+    if contributor_available:
+        query = f"""
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE o.is_collaborator IS TRUE
+                      AND o.is_contributor IS NOT TRUE
+                ) AS collaborator_only_count,
+
+                COUNT(*) FILTER (
+                    WHERE o.is_collaborator IS NOT TRUE
+                      AND o.is_contributor IS TRUE
+                ) AS contributor_only_count,
+
+                COUNT(*) FILTER (
+                    WHERE o.is_collaborator IS TRUE
+                      AND o.is_contributor IS TRUE
+                ) AS both_count,
+
+                COUNT(*) FILTER (
+                    WHERE o.is_collaborator IS NOT TRUE
+                      AND o.is_contributor IS NOT TRUE
+                ) AS neither_count
+
+            FROM {SCHEMA_NAME}.organizations o
+
+            LEFT JOIN {SCHEMA_NAME}.states s
+                ON o.state_id = s.state_id
+
+            {where_clause};
         """
-        COUNT(*) FILTER (
-            WHERE o.is_contributor = TRUE
+
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+
+        collaborator_only_count = int(
+            row["collaborator_only_count"] or 0
         )
-        """
-        if contributor_available
-        else "0"
-    )
+        contributor_only_count = int(
+            row["contributor_only_count"] or 0
+        )
+        both_count = int(
+            row["both_count"] or 0
+        )
+        neither_count = int(
+            row["neither_count"] or 0
+        )
+
+        total = (
+            collaborator_only_count
+            + contributor_only_count
+            + both_count
+            + neither_count
+        )
+
+        def percentage(count):
+            return (
+                round(count / total * 100, 2)
+                if total
+                else 0
+            )
+
+        return [
+            {
+                "type": "collaborator_only",
+                "organization_count": collaborator_only_count,
+                "percentage": percentage(
+                    collaborator_only_count
+                ),
+            },
+            {
+                "type": "contributor_only",
+                "organization_count": contributor_only_count,
+                "percentage": percentage(
+                    contributor_only_count
+                ),
+            },
+            {
+                "type": "both",
+                "organization_count": both_count,
+                "percentage": percentage(
+                    both_count
+                ),
+            },
+            {
+                "type": "neither",
+                "organization_count": neither_count,
+                "percentage": percentage(
+                    neither_count
+                ),
+            },
+        ]
 
     query = f"""
         SELECT
-            COUNT(*) AS total_organizations,
-
             COUNT(*) FILTER (
-                WHERE o.is_collaborator = TRUE
+                WHERE o.is_collaborator IS TRUE
             ) AS collaborator_count,
 
-            {contributor_expression}
-                AS contributor_count
+            COUNT(*) FILTER (
+                WHERE o.is_collaborator IS NOT TRUE
+            ) AS non_collaborator_count
 
         FROM {SCHEMA_NAME}.organizations o
 
-        LEFT JOIN {SCHEMA_NAME}.state s
+        LEFT JOIN {SCHEMA_NAME}.states s
             ON o.state_id = s.state_id
 
         {where_clause};
@@ -522,42 +848,36 @@ def fetch_collaborator_vs_contributor(
     cursor.execute(query, params)
     row = cursor.fetchone()
 
-    total = int(row["total_organizations"] or 0)
     collaborator_count = int(
         row["collaborator_count"] or 0
     )
-    contributor_count = int(
-        row["contributor_count"] or 0
+    non_collaborator_count = int(
+        row["non_collaborator_count"] or 0
     )
 
-    collaborator_percentage = (
-        round(
-            collaborator_count / total * 100,
-            2,
-        )
-        if total
-        else 0
-    )
+    total = collaborator_count + non_collaborator_count
 
-    contributor_percentage = (
-        round(
-            contributor_count / total * 100,
-            2,
+    def percentage(count):
+        return (
+            round(count / total * 100, 2)
+            if total
+            else 0
         )
-        if total
-        else 0
-    )
 
     return [
         {
             "type": "collaborator",
             "organization_count": collaborator_count,
-            "percentage": collaborator_percentage,
+            "percentage": percentage(
+                collaborator_count
+            ),
         },
         {
-            "type": "contributor",
-            "organization_count": contributor_count,
-            "percentage": contributor_percentage,
+            "type": "non_collaborator",
+            "organization_count": non_collaborator_count,
+            "percentage": percentage(
+                non_collaborator_count
+            ),
         },
     ]
 
@@ -587,7 +907,7 @@ def fetch_rating_distribution(cursor, filters):
 
             FROM {SCHEMA_NAME}.organizations o
 
-            LEFT JOIN {SCHEMA_NAME}.state s
+            LEFT JOIN {SCHEMA_NAME}.states s
                 ON o.state_id = s.state_id
 
             {rating_where}
@@ -644,26 +964,22 @@ def fetch_organization_type_distribution(
             ) AS period,
 
             COUNT(*) FILTER (
-                WHERE LOWER(o.org_type)
-                    IN (
-                        'for-profit',
-                        'for_profit'
-                    )
+                WHERE LOWER(
+                    REPLACE(o.org_type::text, '-', '_')
+                ) = 'for_profit'
             ) AS for_profit,
 
             COUNT(*) FILTER (
-                WHERE LOWER(o.org_type)
-                    IN (
-                        'non-profit',
-                        'non_profit'
-                    )
+                WHERE LOWER(
+                    REPLACE(o.org_type::text, '-', '_')
+                ) = 'non_profit'
             ) AS non_profit,
 
             COUNT(*) AS total
 
         FROM {SCHEMA_NAME}.organizations o
 
-        LEFT JOIN {SCHEMA_NAME}.state s
+        LEFT JOIN {SCHEMA_NAME}.states s
             ON o.state_id = s.state_id
 
         {where_clause}
